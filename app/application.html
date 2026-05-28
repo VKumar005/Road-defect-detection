@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pothole Detection - Frame Review</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+<style>
+  body {
+    background: #f8fafc;
+    font-family: "Segoe UI", Arial, sans-serif;
+    min-height: 100vh;
+    color: #0f172a;
+  }
+
+  .glass {
+    background: #ffffff;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+  }
+
+  .spinner {
+    border: 4px solid #e2e8f0;
+    border-top-color: #0f172a;
+    animation: spin 1s linear infinite;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .result-card {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+
+  .result-meta {
+    font-size: 12px;
+    color: #64748b;
+    letter-spacing: 0.4px;
+  }
+
+  .grid { display: grid; gap: 16px; }
+  @media (min-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (min-width: 1024px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+</style>
+</head>
+
+<body class="p-6 bg-slate-50">
+
+<!-- HEADER -->
+<div class="text-center mb-10">
+  <h1 class="text-3xl font-semibold text-slate-900">Defect Detection - Frame review</h1>
+  <p class="text-slate-600 mt-2 text-base"></p>
+</div>
+
+<!-- MAIN CARD -->
+<div class="glass max-w-5xl mx-auto p-6">
+
+  <!-- FILE UPLOAD BUTTON -->
+  <div class="mt-4 text-center">
+    <label for="videoUpload"
+      class="inline-flex items-center gap-3 cursor-pointer px-5 py-3 rounded-lg bg-slate-900 hover:bg-slate-800 transition text-white font-semibold">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none"
+           viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round"
+              d="M7 16a4 4 0 018 0m-4 4V4m0 0L5 9m7-5l7 5"/>
+      </svg>
+      Select Video File
+    </label>
+    <input id="videoUpload" type="file" accept="video/*" class="hidden" />
+  </div>
+
+  <!-- STATUS BAR -->
+  <div class="flex flex-col gap-4 mt-6 p-4 glass md:flex-row md:items-center md:justify-between">
+    <div class="flex items-center gap-3">
+      <div id="spinner" class="spinner hidden"></div>
+      <div id="status" class="text-slate-700">Loading model...</div>
+    </div>
+    <div>
+      <p class="text-xs text-slate-500">Detected Frames</p>
+      <p id="count" class="text-3xl font-bold text-slate-900 text-right">0</p>
+    </div>
+  </div>
+
+  <div class="mt-6 grid gap-3 md:grid-cols-3">
+    <div class="glass p-4">
+      <p class="text-sm text-slate-700">Processing</p>
+      <div class="mt-2 text-xs text-slate-500"></div>
+      <div class="mt-4 flex flex-col gap-2 text-sm">
+        <label class="flex items-center justify-between gap-3">
+          <span class="text-slate-600">Frame interval (ms)</span>
+          <input id="intervalMs" type="number" min="100" value="1000" class="w-24 rounded bg-white border border-slate-300 px-2 py-1 text-slate-900" />
+        </label>
+        <label class="flex items-center justify-between gap-3">
+          <span class="text-slate-600">Max results</span>
+          <input id="maxResults" type="number" min="5" value="60" class="w-24 rounded bg-white border border-slate-300 px-2 py-1 text-slate-900" />
+        </label>
+      </div>
+        <button id="startBtn" class="mt-4 w-full px-4 py-2 rounded bg-slate-900 hover:bg-slate-800 text-white font-semibold" disabled>Start Processing</button>
+        <button id="downloadBtn" class="mt-2 w-full px-4 py-2 rounded bg-slate-200 hover:bg-slate-300 text-slate-900 font-semibold" disabled>Download Results (ZIP)</button>
+    </div>
+    <div class="glass p-4 md:col-span-2">
+      <p class="text-sm text-slate-700">Results</p>
+      <div id="results" class="grid mt-3"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const MODEL_PATH = "pothole_detector_ref/yolov8n_train/weights/best.onnx";
+const MODEL_W = 640;
+const MODEL_H = 640;
+const SCORE_THRESHOLD = 0.3;
+const IOU_THRESH = 0.45;
+const ARTIFACT_IOU = 0.7;
+const ARTIFACT_FRAMES = 4;
+const ARTIFACT_WINDOW_SEC = 6;
+const STATIC_MOVE_PX = 8;
+const MASK_REGION = { x1: 0.35, x2: 0.65, y1: 0.72, y2: 1.0 };
+const MASK_ENABLED = true;
+const MAX_SCAN_SECONDS = 300;
+const MAX_FRAMES = 300;
+
+const video = document.createElement("video");
+video.muted = true;
+video.playsInline = true;
+video.preload = "auto";
+const inputCanvas = document.createElement("canvas");
+const inputCtx = inputCanvas.getContext("2d", { willReadFrequently: true });
+
+const statusEl = document.getElementById("status");
+const spinner = document.getElementById("spinner");
+const countEl = document.getElementById("count");
+const startBtn = document.getElementById("startBtn");
+const downloadBtn = document.getElementById("downloadBtn");
+const resultsEl = document.getElementById("results");
+const intervalMsEl = document.getElementById("intervalMs");
+const maxResultsEl = document.getElementById("maxResults");
+
+let session;
+let isProcessing = false;
+let currentVideoUrl = "";
+let artifactTracks = [];
+
+function iou(a, b){
+  const x1 = Math.max(a[0], b[0]);
+  const y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[2], b[2]);
+  const y2 = Math.min(a[3], b[3]);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const areaA = (a[2]-a[0]) * (a[3]-a[1]);
+  const areaB = (b[2]-b[0]) * (b[3]-b[1]);
+  return inter / (areaA + areaB - inter + 1e-8);
+}
+
+function waitForEvent(target, eventName, timeoutMs){
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      target.removeEventListener(eventName, onEvent);
+      reject(new Error(`Timeout waiting for ${eventName}`));
+    }, timeoutMs);
+    const onEvent = () => {
+      clearTimeout(timer);
+      target.removeEventListener(eventName, onEvent);
+      resolve();
+    };
+    target.addEventListener(eventName, onEvent);
+  });
+}
+
+async function seekTo(videoEl, timeSec){
+  if(!Number.isFinite(timeSec)) return;
+  videoEl.currentTime = timeSec;
+  try {
+    await waitForEvent(videoEl, "seeked", 3000);
+  } catch {
+    // Some codecs don’t fire seeked reliably; accept current frame.
+  }
+}
+
+async function loadModel(){
+  spinner.classList.remove("hidden");
+  statusEl.textContent = "Loading model...";
+  ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 4);
+  ort.env.wasm.simd = true;
+  session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ["webgl", "wasm"] });
+  spinner.classList.add("hidden");
+  statusEl.textContent = "Model loaded. Select a video to begin.";
+  startBtn.disabled = false;
+}
+
+function clearResults(){
+  resultsEl.innerHTML = "";
+  countEl.textContent = "0";
+  downloadBtn.disabled = true;
+  artifactTracks = [];
+}
+
+function drawBoxes(ctx, boxes){
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#00ff99";
+  ctx.fillStyle = "#00ff99";
+  ctx.font = "16px Inter";
+  boxes.forEach(b => {
+    const [x1, y1, x2, y2, score] = b;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.fillText(`Pothole ${Math.round(score * 100)}%`, x1 + 4, Math.max(16, y1 - 8));
+  });
+}
+
+function addResult(imageDataUrl, timeSec, count){
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.innerHTML = `
+    <img src="${imageDataUrl}" alt="Pothole frame" class="w-full" />
+    <div class="p-3 flex items-center justify-between">
+      <span class="result-meta">Time ${timeSec.toFixed(2)}s</span>
+      <span class="result-meta">${count} pothole(s)</span>
+    </div>
+  `;
+  resultsEl.appendChild(card);
+  countEl.textContent = String(resultsEl.children.length);
+  downloadBtn.disabled = false;
+}
+
+function computeBoxes(data, n, outW, outH){
+  const boxes = [];
+  for(let i = 0; i < n; i++){
+    const cx = data[i];
+    const cy = data[n + i];
+    const w = data[2 * n + i];
+    const h = data[3 * n + i];
+    const conf = data[4 * n + i];
+    if(conf > SCORE_THRESHOLD){
+      const x1 = (cx - w / 2) * outW / MODEL_W;
+      const y1 = (cy - h / 2) * outH / MODEL_H;
+      const x2 = (cx + w / 2) * outW / MODEL_W;
+      const y2 = (cy + h / 2) * outH / MODEL_H;
+      boxes.push([x1, y1, x2, y2, conf]);
+    }
+  }
+  return boxes;
+}
+
+function nms(boxes){
+  const picked = [];
+  const sorted = boxes.slice().sort((a, b) => b[4] - a[4]);
+  while(sorted.length){
+    const current = sorted.shift();
+    picked.push(current);
+    for(let i = sorted.length - 1; i >= 0; i--){
+      const ov = iou(current, sorted[i]);
+      if(ov > IOU_THRESH) sorted.splice(i, 1);
+    }
+  }
+  return picked;
+}
+
+function inMaskRegion(box){
+  if(!MASK_ENABLED) return false;
+  const [x1, y1, x2, y2] = box;
+  const cx = (x1 + x2) / 2;
+  const cy = (y1 + y2) / 2;
+  const w = video.videoWidth || MODEL_W;
+  const h = video.videoHeight || MODEL_H;
+  const rx1 = MASK_REGION.x1 * w;
+  const rx2 = MASK_REGION.x2 * w;
+  const ry1 = MASK_REGION.y1 * h;
+  const ry2 = MASK_REGION.y2 * h;
+  return cx >= rx1 && cx <= rx2 && cy >= ry1 && cy <= ry2;
+}
+
+function boxCenter(b){ return [(b[0]+b[2])/2, (b[1]+b[3])/2]; }
+
+function updateArtifactTracks(boxes, timeSec){
+  const now = timeSec;
+  const updated = [];
+  for(const box of boxes){
+    let best = null;
+    let bestIou = 0;
+    for(const tr of artifactTracks){
+      const ov = iou(box, tr.box);
+      if(ov > bestIou){ bestIou = ov; best = tr; }
+    }
+    if(best && bestIou >= ARTIFACT_IOU && (now - best.lastSeen) <= ARTIFACT_WINDOW_SEC){
+      const [cx, cy] = boxCenter(box);
+      const dx = cx - best.cx;
+      const dy = cy - best.cy;
+      const moved = Math.hypot(dx, dy);
+      best.hits += 1;
+      best.lastSeen = now;
+      best.box = box;
+      best.cx = cx;
+      best.cy = cy;
+      if(moved <= STATIC_MOVE_PX) best.staticHits += 1;
+      updated.push(best);
+    } else {
+      const [cx, cy] = boxCenter(box);
+      updated.push({ box, hits: 1, staticHits: 1, lastSeen: now, isArtifact: false, cx, cy });
+    }
+  }
+  artifactTracks = updated.filter(t => (now - t.lastSeen) <= ARTIFACT_WINDOW_SEC);
+  artifactTracks.forEach(t => {
+    if(t.staticHits >= ARTIFACT_FRAMES) t.isArtifact = true;
+  });
+}
+
+function filterArtifacts(boxes, timeSec){
+  updateArtifactTracks(boxes, timeSec);
+  return boxes.filter(b => {
+    if(inMaskRegion(b)) return false;
+    return !artifactTracks.some(t => t.isArtifact && iou(b, t.box) >= ARTIFACT_IOU);
+  });
+}
+
+async function processVideo(file){
+  if(isProcessing) return;
+  isProcessing = true;
+  clearResults();
+  statusEl.textContent = "Decoding video...";
+  downloadBtn.disabled = true;
+  if(currentVideoUrl) URL.revokeObjectURL(currentVideoUrl);
+  currentVideoUrl = URL.createObjectURL(file);
+  video.src = currentVideoUrl;
+  video.load();
+  try {
+    await waitForEvent(video, "loadedmetadata", 5000);
+  } catch {
+    statusEl.textContent = "Could not read video metadata. Try a different file.";
+    isProcessing = false;
+    return;
+  }
+
+  const intervalMs = Math.max(100, Number(intervalMsEl.value || 1000));
+  const maxResults = Math.max(5, Number(maxResultsEl.value || 60));
+  const duration = video.duration || 0;
+  const scanDuration = Math.min(duration, MAX_SCAN_SECONDS);
+
+  inputCanvas.width = MODEL_W;
+  inputCanvas.height = MODEL_H;
+
+  statusEl.textContent = "Processing video...";
+
+  let lastSampleAt = -Infinity;
+  let processedFrames = 0;
+  let busy = false;
+  let stopped = false;
+
+  function finish(message){
+    if(stopped) return;
+    stopped = true;
+    isProcessing = false;
+    video.pause();
+    statusEl.textContent = message;
+  }
+
+  async function processCurrentFrame(){
+    if(busy || stopped) return;
+    const now = performance.now();
+    if(now - lastSampleAt < intervalMs) return;
+    if(video.currentTime >= scanDuration) return finish("Done. Review the detected frames below.");
+    if(resultsEl.children.length >= maxResults) return finish("Done. Review the detected frames below.");
+    if(processedFrames >= MAX_FRAMES) return finish("Done. Review the detected frames below.");
+
+    busy = true;
+    lastSampleAt = now;
+    processedFrames += 1;
+
+    inputCtx.clearRect(0, 0, MODEL_W, MODEL_H);
+    inputCtx.drawImage(video, 0, 0, MODEL_W, MODEL_H);
+    const img = inputCtx.getImageData(0, 0, MODEL_W, MODEL_H).data;
+    const input = new Float32Array(3 * MODEL_W * MODEL_H);
+    const hw = MODEL_W * MODEL_H;
+    for(let p = 0; p < hw; p++){
+      input[p] = img[p * 4] / 255;
+      input[p + hw] = img[p * 4 + 1] / 255;
+      input[p + 2 * hw] = img[p * 4 + 2] / 255;
+    }
+
+    const tensor = new ort.Tensor("float32", input, [1, 3, MODEL_H, MODEL_W]);
+    const out = (await session.run({ [session.inputNames[0]]: tensor }))[session.outputNames[0]];
+    const data = out.data;
+    const n = out.dims[2];
+
+    let boxes = computeBoxes(data, n, video.videoWidth || MODEL_W, video.videoHeight || MODEL_H);
+    boxes = nms(boxes);
+    boxes = filterArtifacts(boxes, video.currentTime);
+
+    if(boxes.length > 0){
+      const outCanvas = document.createElement("canvas");
+      outCanvas.width = video.videoWidth || MODEL_W;
+      outCanvas.height = video.videoHeight || MODEL_H;
+      const outCtx = outCanvas.getContext("2d");
+      outCtx.drawImage(video, 0, 0, outCanvas.width, outCanvas.height);
+      drawBoxes(outCtx, boxes);
+      addResult(outCanvas.toDataURL("image/jpeg", 0.85), video.currentTime, boxes.length);
+    }
+
+    statusEl.textContent = `Processed ${processedFrames} frame(s)...`;
+    busy = false;
+  }
+
+  const hasVFC = typeof video.requestVideoFrameCallback === "function";
+  const onFrame = async () => {
+    if(stopped) return;
+    await processCurrentFrame();
+    if(stopped) return;
+    if(hasVFC) video.requestVideoFrameCallback(onFrame);
+    else requestAnimationFrame(onFrame);
+  };
+
+  try {
+    await video.play();
+  } catch {
+    isProcessing = false;
+    statusEl.textContent = "Playback blocked. Click Start again.";
+    return;
+  }
+
+  if(hasVFC) video.requestVideoFrameCallback(onFrame);
+  else requestAnimationFrame(onFrame);
+}
+
+function dataUrlToBlob(dataUrl){
+  const parts = dataUrl.split(",");
+  const mime = parts[0].match(/:(.*?);/)[1];
+  const bstr = atob(parts[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while(n--) u8arr[n] = bstr.charCodeAt(n);
+  return new Blob([u8arr], { type: mime });
+}
+
+async function downloadZip(){
+  if(resultsEl.children.length === 0) return;
+  downloadBtn.disabled = true;
+  statusEl.textContent = "Building ZIP...";
+
+  const zip = new JSZip();
+  const files = Array.from(resultsEl.querySelectorAll("img"));
+  for(let i = 0; i < files.length; i++){
+    const img = files[i];
+    const blob = dataUrlToBlob(img.src);
+    const name = `pothole_${String(i+1).padStart(3,"0")}.png`;
+    zip.file(name, blob);
+  }
+
+  const content = await zip.generateAsync({ type: "blob" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(content);
+  link.download = "pothole_results.zip";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  statusEl.textContent = "ZIP downloaded.";
+  downloadBtn.disabled = false;
+}
+
+document.getElementById("videoUpload").addEventListener("change", e => {
+  const file = e.target.files && e.target.files[0];
+  if(!file) return;
+  startBtn.disabled = false;
+  startBtn.textContent = "Start Processing";
+  startBtn.onclick = () => processVideo(file);
+});
+
+downloadBtn.addEventListener("click", downloadZip);
+
+loadModel();
+</script>
+
+</body>
+</html>

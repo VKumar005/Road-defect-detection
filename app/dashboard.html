@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Real-Time Pothole Detection Dashboard</title>
+
+<!-- Tailwind -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Google Maps — replace YOUR_GOOGLE_MAPS_API_KEY with your actual key -->
+<script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY"></script>
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<style>
+  html, body { margin:0; padding:0; height:100%; }
+  #googleMap, #leafletMap {
+    position:absolute;
+    top:0; left:0; width:100%; height:100%;
+  }
+  #leafletMap { display:none; }
+
+  .stats-overlay {
+    position:absolute; top:20px; left:20px;
+    background:white; border-radius:12px;
+    box-shadow:0 10px 25px rgba(0,0,0,0.2);
+    z-index:1000; padding:20px; min-width:280px;
+  }
+  .status-indicator{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px;}
+  .status-connected{background-color:#10B981;box-shadow:0 0 8px rgba(16,185,129,0.6);}
+  .status-disconnected{background-color:#EF4444;}
+</style>
+</head>
+<body class="bg-gray-50 overflow-hidden">
+
+<div id="googleMap"></div>
+<div id="leafletMap"></div>
+
+<!-- Overlay Panel -->
+<div class="stats-overlay">
+  <div class="flex items-center justify-between mb-4">
+    <h2 class="text-xl font-bold text-gray-800">Pothole Detection</h2>
+    <div class="flex items-center">
+      <span id="statusIndicator" class="status-indicator status-disconnected"></span>
+      <span id="statusText" class="text-sm text-gray-600">Connecting...</span>
+    </div>
+  </div>
+
+  <div class="space-y-3">
+    <div class="bg-blue-50 p-3 rounded-lg">
+      <div class="text-sm text-blue-600 font-medium">Total Potholes</div>
+      <div id="totalPotholes" class="text-2xl font-bold text-blue-800">0</div>
+    </div>
+  </div>
+
+  <button onclick="centerMapOnPotholes()" class="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg shadow-md">
+    Center on Potholes
+  </button>
+  <button onclick="clearAllPotholes()" class="mt-2 w-full bg-red-600 hover:bg-red-700 text-white font-medium py-2 px-4 rounded-lg shadow-md">
+    Clear All Data
+  </button>
+  <button id="mapToggleBtn" class="mt-2 w-full bg-gray-700 hover:bg-gray-800 text-white font-medium py-2 px-4 rounded-lg shadow-md">
+    Switch to Leaflet Map
+  </button>
+</div>
+
+<div id="loadingSpinner" class="fixed inset-0 flex items-center justify-center bg-gray-900 bg-opacity-50 z-50">
+  <div class="bg-white p-6 rounded-lg shadow-xl text-center">
+    <div class="border-4 border-gray-200 border-t-blue-500 rounded-full w-10 h-10 animate-spin mx-auto mb-4"></div>
+    <p class="text-gray-700 font-medium">Loading Dashboard...</p>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------
+// Firebase Configuration
+// Replace the values below with your own Firebase project config.
+// DO NOT commit real keys to GitHub.
+// ---------------------------------------------------------------
+const __app_id = "YOUR_FIREBASE_APP_ID";
+const __firebase_config = {
+  apiKey:            "YOUR_FIREBASE_API_KEY",
+  authDomain:        "YOUR_PROJECT_ID.firebaseapp.com",
+  projectId:         "YOUR_PROJECT_ID",
+  storageBucket:     "YOUR_PROJECT_ID.appspot.com",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId:             "YOUR_APP_ID"
+};
+const FIRESTORE_COLLECTION = `artifacts/${__app_id}/public/data/potholes`;
+
+let db;
+let googleMap, leafletMap;
+let useLeaflet = false;
+let markers = [];
+let leafletMarkers = [];
+let potholeData = [];
+let infoWindow;
+
+// Firebase init
+function initFirebase(){
+  firebase.initializeApp(__firebase_config);
+  db = firebase.firestore();
+  updateConnectionStatus(true);
+}
+
+// Google Maps init
+function initGoogleMap(){
+  googleMap = new google.maps.Map(document.getElementById('googleMap'), {
+    center:{lat:20.59,lng:78.96}, zoom:5,
+    mapTypeControl:true, streetViewControl:true
+  });
+  infoWindow = new google.maps.InfoWindow();
+  initFirebase();
+  listenForPotholes();
+  hideLoadingSpinner();
+}
+
+// Leaflet init
+function initLeafletMap(){
+  leafletMap = L.map('leafletMap').setView([20.59,78.96],5);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(leafletMap);
+}
+
+// Toggle map
+document.getElementById('mapToggleBtn').addEventListener('click',()=>{
+  useLeaflet = !useLeaflet;
+  if(useLeaflet){
+    document.getElementById('googleMap').style.display='none';
+    document.getElementById('leafletMap').style.display='block';
+    document.getElementById('mapToggleBtn').innerText='Switch to Google Map';
+    if(!leafletMap) initLeafletMap();
+    potholeData.forEach(p => addPotholeMarker(p));
+  } else {
+    document.getElementById('leafletMap').style.display='none';
+    document.getElementById('googleMap').style.display='block';
+    document.getElementById('mapToggleBtn').innerText='Switch to Leaflet Map';
+    potholeData.forEach(p => addPotholeMarker(p));
+  }
+});
+
+// Firestore real-time listener
+function listenForPotholes(){
+  db.collection(FIRESTORE_COLLECTION).onSnapshot(snap => {
+    potholeData = [];
+    snap.forEach(doc => {
+      let d = {id: doc.id, ...doc.data()};
+      potholeData.push(d);
+      addPotholeMarker(d);
+    });
+    updateStatistics();
+  });
+}
+
+// Add marker to active map
+function addPotholeMarker(data){
+  if(!data.latitude || !data.longitude) return;
+  if(useLeaflet){
+    const marker = L.marker([data.latitude, data.longitude]).addTo(leafletMap)
+      .bindPopup(`<b>Pothole</b><br>${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`);
+    leafletMarkers.push(marker);
+  } else {
+    const marker = new google.maps.Marker({
+      position: {lat: data.latitude, lng: data.longitude},
+      map: googleMap,
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE,
+        scale: 8,
+        fillColor: '#EF4444',
+        fillOpacity: 1,
+        strokeColor: '#fff',
+        strokeWeight: 2
+      }
+    });
+    marker.addListener('click', () =>
+      infoWindow.setContent(`<b>Pothole</b><br>${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`)
+    );
+    markers.push(marker);
+  }
+}
+
+// Update stats panel
+function updateStatistics(){
+  document.getElementById('totalPotholes').innerText = potholeData.length;
+}
+
+// Center map on all potholes
+function centerMapOnPotholes(){
+  if(useLeaflet && leafletMarkers.length){
+    const group = L.featureGroup(leafletMarkers);
+    leafletMap.fitBounds(group.getBounds());
+  } else if(!useLeaflet && markers.length){
+    const bounds = new google.maps.LatLngBounds();
+    markers.forEach(m => bounds.extend(m.getPosition()));
+    googleMap.fitBounds(bounds);
+  } else {
+    alert('No potholes detected yet!');
+  }
+}
+
+// Clear all Firestore data and markers
+async function clearAllPotholes(){
+  if(!confirm('Delete all pothole data?')) return;
+  try {
+    const snapshot = await db.collection(FIRESTORE_COLLECTION).get();
+    if(snapshot.empty){ alert("No data to delete."); return; }
+
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+
+    potholeData = [];
+    markers.forEach(m => m.setMap(null));
+    markers = [];
+    leafletMarkers.forEach(m => leafletMap?.removeLayer(m));
+    leafletMarkers = [];
+
+    updateStatistics();
+    alert("All pothole data cleared successfully.");
+  } catch(error){
+    console.error("Error clearing data:", error);
+    alert("Error clearing data. Check console.");
+  }
+}
+
+// UI helpers
+function updateConnectionStatus(ok){
+  const i = document.getElementById('statusIndicator');
+  const t = document.getElementById('statusText');
+  if(ok){
+    i.classList.add('status-connected');
+    i.classList.remove('status-disconnected');
+    t.innerText = 'Connected';
+  } else {
+    i.classList.remove('status-connected');
+    i.classList.add('status-disconnected');
+    t.innerText = 'Disconnected';
+  }
+}
+
+function hideLoadingSpinner(){
+  document.getElementById('loadingSpinner').style.display = 'none';
+}
+
+window.addEventListener('load', initGoogleMap);
+</script>
+
+</body>
+</html>
