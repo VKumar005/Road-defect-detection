@@ -285,7 +285,3 @@ Full curves and visualizations are in `results/`.
 - Multi-defect classification (cracks, patches, etc.)
 
 ---
-
-## License
-
-Academic / research use only.
